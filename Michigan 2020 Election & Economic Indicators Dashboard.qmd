@@ -1,0 +1,221 @@
+---
+title: "Michigan 2020 Election Dashboard"
+author: "Zhiyan Chen & Cliff Mutegi"
+format: 
+  dashboard:
+    theme: flatly
+    orientation: rows
+    scrolling: true 
+    nav-buttons: [github]
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+library(tidyverse)
+library(janitor)
+library(leaflet)
+library(tigris)
+library(sf)
+library(scales)
+library(ggthemes)
+library(bsicons) # For dashboard icons
+library(plotly)  # For interactive ggplots
+library(flextable)
+
+# --- Global Settings ---
+# Accessible Palette (Same as Report)
+party_colors <- c("DEMOCRAT" = "#0072B2", "REPUBLICAN" = "#D55E00", "LIBERTARIAN" = "#E69F00", "OTHER" = "#999999")
+theme_set(theme_minimal(base_size = 12))
+
+# --- Data Loading ---
+# Load Datasets
+elections <- read_csv("countypres_2000-2020.csv") |> clean_names()
+census <- read_csv("census_data_county_2009-2023.csv") |> clean_names()
+
+# Clean and Merge (Matched to Final Report V6)
+elections <- elections |> 
+  mutate(county_name = str_to_title(county_name))
+
+mi_elections <- elections |> 
+  filter(state == "MICHIGAN", year == 2020) |> 
+  mutate(county_fips = as.numeric(county_fips))
+
+mi_census <- census |> 
+  filter(year == 2019) |> 
+  mutate(geoid = as.numeric(geoid)) # Keep 'geoid' for join
+
+# Joining using explicit keys (Same as Report)
+merged_df <- left_join(mi_elections, mi_census, by = c("county_fips" = "geoid"))
+
+# Winner Calculation
+county_outcomes <- merged_df |> 
+  group_by(county_name, county_fips) |> 
+  slice_max(candidatevotes, n = 1) |> 
+  ungroup() |> 
+  mutate(winning_party = party) |> 
+  select(county_name, county_fips, winning_party, median_income, prop_poverty, population, totalvotes)
+
+# --- Calculations for Value Boxes ---
+total_votes <- sum(county_outcomes$totalvotes, na.rm = TRUE)
+dem_counties <- sum(county_outcomes$winning_party == "DEMOCRAT")
+rep_counties <- sum(county_outcomes$winning_party == "REPUBLICAN")
+
+# Income Gap Calculation
+income_stats <- county_outcomes |> 
+  group_by(winning_party) |> 
+  summarize(mean_income = mean(median_income, na.rm=TRUE))
+
+dem_income <- income_stats$mean_income[income_stats$winning_party == "DEMOCRAT"]
+rep_income <- income_stats$mean_income[income_stats$winning_party == "REPUBLICAN"]
+income_gap <- dem_income - rep_income
+```
+
+# Overview
+## Row {height=15%}
+```{r}
+#| content: valuebox
+#| title: "Total Votes Cast"
+
+list(
+  icon = "person-check-fill",
+  color = "primary",
+  value = comma(total_votes)
+)
+```
+```{r}
+#| content: valuebox
+#| title: "Counties Won (Dem)"
+
+list(
+  icon = "flag-fill",
+  color = "#0072B2",
+  value = dem_counties
+)
+```
+
+```{r}
+#| content: valuebox
+#| title: "Counties Won (GOP)"
+
+list(
+  icon = "flag-fill",
+  color = "#D55E00",
+  value = rep_counties
+)
+```
+```{r}
+#| content: valuebox
+#| title: "Avg Income Gap (Dem - Rep)"
+
+list(
+  icon = "currency-dollar",
+  color = "success",
+  value = paste0("$", comma(round(income_gap)))
+)
+```
+
+## Row {height=50%}
+### Column {width=65%}
+```{r}
+#| title: "Interactive Election Map"
+
+# Get Shapefile (Cached)
+options(tigris_use_cache = TRUE)
+mi_counties <- counties(state = "MI", cb = TRUE, year = 2020, progress_bar = FALSE)
+
+# Join
+map_data <- mi_counties |> 
+  mutate(GEOID = as.numeric(GEOID)) |> 
+  left_join(county_outcomes, by = c("GEOID" = "county_fips"))
+
+# Palette
+pal <- colorFactor(palette = c("#0072B2", "#D55E00"), domain = map_data$winning_party)
+
+leaflet(map_data) |> 
+  addTiles() |> 
+  addPolygons(
+    fillColor = ~pal(winning_party),
+    weight = 1,
+    opacity = 1,
+    color = "white",
+    fillOpacity = 0.7,
+    highlightOptions = highlightOptions(weight = 2, color = "#666", fillOpacity = 0.9, bringToFront = TRUE),
+    label = ~paste0(county_name, ": ", winning_party, 
+                    " (Pop: ", comma(population), 
+                    ", Income: $", comma(median_income), ")")
+  ) |> 
+  addLegend(pal = pal, values = ~winning_party, title = "Winner", position = "bottomright")
+```
+
+### Column {width=35%}
+
+```{r}
+#| title: "Income vs. Voter Participation"
+
+# Calculate votes per capita
+scatter_data <- county_outcomes |> 
+  mutate(votes_per_capita = round(totalvotes / population, 3)) |> 
+  filter(winning_party %in% c("DEMOCRAT", "REPUBLICAN"))
+
+p <- ggplot(scatter_data, aes(x = median_income, y = votes_per_capita, 
+                              color = winning_party, 
+                              text = paste("County:", county_name, 
+                                           "<br>Income:", dollar(median_income),
+                                           "<br>Votes/Capita:", votes_per_capita))) +
+  geom_point(alpha = 0.7, size = 2) +
+  geom_smooth(method = "lm", se = FALSE, size = 1) +
+  scale_color_manual(values = party_colors) +
+  scale_x_continuous(labels = dollar_format()) +
+  labs(x = "Median Income", y = "Votes Per Capita", color = NULL) +
+  theme(legend.position = "none")
+
+# Turn into interactive plotly
+ggplotly(p, tooltip = "text")
+```
+
+## Row {height=45%}
+### Column {.tabset}
+```{r}
+#| title: "Top 15 Wealthiest Counties"
+
+top_wealth_counties <- county_outcomes |> 
+  slice_max(median_income, n = 15)
+
+p_lolli <- ggplot(top_wealth_counties, aes(x = reorder(county_name, median_income), y = median_income, color = winning_party,
+                                           text = paste("Income:", dollar(median_income)))) +
+  geom_segment(aes(x = reorder(county_name, median_income), 
+                   xend = reorder(county_name, median_income), 
+                   y = 0, yend = median_income), 
+               color = "grey70", size = 0.8) +
+  geom_point(size = 3) +
+  scale_color_manual(values = party_colors) +
+  scale_y_continuous(labels = dollar_format()) +
+  coord_flip() +
+  labs(x = NULL, y = "Median Household Income", color = "Winner") +
+  theme(
+    legend.position = "bottom",
+    axis.text.y = element_text(size = 9) # Reduced size slightly to help fit
+  )
+
+ggplotly(p_lolli, tooltip = "text")
+```
+
+```{r}
+#| title: "Data Summary Table"
+
+county_outcomes |> 
+  select(County = county_name, Winner = winning_party, Population = population, Income = median_income, Votes = totalvotes) |> 
+  arrange(desc(Population)) |> 
+  head(20) |> 
+  flextable() |> 
+  colformat_double(j = "Income", prefix = "$", digits = 0) |> 
+  colformat_double(j = c("Population", "Votes"), digits = 0) |> 
+  autofit()
+```
+
