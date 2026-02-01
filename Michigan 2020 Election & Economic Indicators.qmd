@@ -1,0 +1,562 @@
+---
+title: "Final Project: Economic Indicators and Presidential Election Outcomes in Michigan (2020)"
+author: "Zhiyan Chen, Cliff Mutegi"
+date: today
+format: 
+  html:
+    theme: flatly
+    self-contained: true
+    embed-resources: true
+    toc: true
+    toc-depth: 3
+    code-fold: show
+execute:
+  eval: true
+  echo: true
+  warning: false
+  message: false
+  error: true
+---
+
+# Michigan 2020 Election Analysis
+
+## Introduction
+
+This project analyzes the relationship between county-level economic indicators and presidential election outcomes in **Michigan** during the **2020** election. We focus on whether economic factors like median income and poverty rates correlate with a county's choice between the Democratic and Republican parties.
+
+We utilize two primary datasets: 2020 Election Returns and 2019 American Community Survey (Census) data.
+
+```{r}
+#| label: setup
+#| include: false
+
+# Loading necessary packages
+library(tidyverse) # Core data manipulation and plotting
+library(janitor)   # For cleaning column names
+library(lubridate) # For date manipulation (Rubric Requirement)
+library(flextable) # For professional summary tables
+library(scales)    # For formatting currency and percentages
+library(leaflet)   # For interactive maps (Rubric: Extra Credit)
+library(tigris)    # For county shapefiles
+library(sf)        # For spatial data handling
+library(naniar)    # For visualizing missing data
+library(ggthemes)  # For accessible themes
+
+# --- Rubric Requirement: Colorblind-Friendly Palette ---
+party_colors <- c("DEMOCRAT" = "#0072B2",   # Blue
+                  "REPUBLICAN" = "#D55E00", # Vermilion
+                  "LIBERTARIAN" = "#E69F00",# Orange/Yellow
+                  "OTHER" = "#999999")      # Grey
+
+# --- Rubric Requirement: Legible Plots (Font Size >= 18pt) ---
+theme_set(theme_minimal(base_size = 18))
+theme_update(
+  plot.title = element_text(face = "bold", size = 20),
+  plot.subtitle = element_text(color = "grey30", size = 16),
+  plot.caption = element_text(color = "grey50", size = 12),
+  legend.position = "top",
+  axis.title = element_text(face = "bold")
+)
+```
+
+
+## 1. Data Dictionary & Exploratory Data Analysis
+
+
+### 1.1 Data Dictionary
+```{r}
+#| label: data-dictionary
+#| echo: false
+
+# --- Rubric Requirement: Data Dictionary ---
+dict_df <- tibble::tribble(
+  ~Variable,        ~Type,       ~Description,
+  "county_name",    "Character", "Name of the county in Michigan.",
+  "election_date",  "Date",      "Official date of the election (YYYY-MM-DD).",
+  "party",          "Character", "Political party (Democrat, Republican, etc.).",
+  "candidatevotes", "Numeric",   "Total votes received by a specific candidate.",
+  "median_income",  "Numeric",   "Median household income in the county (USD).",
+  "prop_poverty",   "Numeric",   "Proportion of population living in poverty (0-1).",
+  "population",     "Numeric",   "Total population estimate for the county.",
+  "winning_party",  "Factor",    "The party that received the most votes in that county."
+)
+
+dict_df |> 
+  flextable() |> 
+  set_caption("Table 1.1: Data Dictionary of Key Variables") |> 
+  width(j = "Description", width = 4) |> 
+  theme_vanilla() |> 
+  autofit()
+```
+
+### 1.2 Missingness Analysis
+```{r}
+#| label: missingness
+#| fig-cap: "Visualization of Missing Data Patterns (Michigan 2020)"
+
+# 1. Load Raw Data
+elections_raw <- read_csv("countypres_2000-2020.csv") |> clean_names() 
+
+# 2. Filter for Relevant Scope (Michigan, 2020)
+# We only care about missingness in the data we are actually using.
+mi_missing_check <- elections_raw |> 
+  filter(state == "MICHIGAN", year == 2020)
+
+# 3. Visualize Missingness
+# This now accurately shows if we have missing data for our specific project scope
+gg_miss_var(mi_missing_check, show_pct = TRUE) +
+  labs(title = "Missing Data by Variable",
+       subtitle = "Scope: Michigan 2020 Election Returns",
+       y = "Percent Missing")
+```
+**Reflection on Missingness:** We filtered the raw election data to focus specifically on Michigan in 2020. The visualization confirms that our critical variables—`candidatevotes`, `party`, and `county_fips`—have little to no missing data in this subset. This indicates that the dataset is high-quality and suitable for merging with the Census data without the need for complex imputation methods.
+
+## 2. Data Wrangling
+This section performs all necessary data manipulation, including joining, string cleaning, date conversion, and pivoting.
+```{r}
+#| label: data-wrangling
+
+# 1. Load Data
+elections <- read_csv("countypres_2000-2020.csv") |> clean_names()
+census <- read_csv("census_data_county_2009-2023.csv") |> clean_names()
+
+# 2. Rubric Requirement: Date Manipulation (lubridate)
+# Converting year to Date object
+elections <- elections |> 
+  mutate(election_date = make_date(year, 11, 3)) 
+
+# 3. Rubric Requirement: String Manipulation (stringr) - 3 Unique Functions
+elections <- elections |> 
+  # Function 1: str_to_title (Clean names)
+  mutate(county_name = str_to_title(county_name)) |> 
+  # Function 2: str_c (Create a combined location label)
+  mutate(location_label = str_c(county_name, ", ", state)) |>
+  # Function 3: str_detect (Identify major parties for filtering later)
+  mutate(is_major = str_detect(party, "DEMOCRAT|REPUBLICAN"))
+
+# 4. Filter & Clean Types
+# Prepare Election Data
+mi_elections <- elections |> 
+  filter(state == "MICHIGAN", year == 2020) |> 
+  mutate(county_fips = as.numeric(county_fips))
+
+# Prepare Census Data
+mi_census <- census |> 
+  filter(year == 2019) |> 
+  mutate(geoid = as.numeric(geoid)) 
+
+# 5. Rubric Requirement: Joining Two Tables
+# Merging the datasets using a left_join to retain election records
+merged_df <- left_join(mi_elections, mi_census, by = c("county_fips" = "geoid"))
+
+# 6. Calculate Winner
+county_outcomes <- merged_df |> 
+  group_by(county_name, county_fips) |> 
+  slice_max(candidatevotes, n = 1) |> 
+  ungroup() |> 
+  mutate(winning_party = party) |> 
+  select(county_name, county_fips, winning_party, median_income, prop_poverty, population, totalvotes, election_date)
+
+# 7. Rubric Requirement: Pivoting (Long Format)
+# We pivot the data to create a 'long' version for potential multi-metric plotting
+county_outcomes_long <- county_outcomes |> 
+  pivot_longer(
+    cols = c(median_income, population),
+    names_to = "metric_type",
+    values_to = "metric_value"
+  )
+
+# Preview the pivoted data
+head(county_outcomes_long) |> 
+  flextable() |> 
+  set_caption("Table 2.1: Preview of Pivoted Data (Long Format)") |> 
+  autofit()
+```
+
+## 3. Summary Statistics
+### 3.1 Group-Level Economic Summary
+This table summarizes key economic indicators by the winning party. It reveals that while Republicans won a significantly larger number of counties (72 vs. 11), the counties won by Democrats had a much higher average median income ($58,343 vs. $51,119) and a significantly larger average population size.
+```{r}
+#| label: summary-table-1
+
+# --- Rubric Requirement: Group-level Summary Statistics ---
+summary_stats <- county_outcomes |> 
+  group_by(winning_party) |> 
+  summarize(
+    Counties_Won = n(),
+    Avg_Median_Income = mean(median_income, na.rm = TRUE),
+    Avg_Poverty_Rate = mean(prop_poverty, na.rm = TRUE),
+    Avg_Population = mean(population, na.rm = TRUE)
+  )
+
+summary_stats |> 
+  flextable() |> 
+  set_caption("Table 3.1: Economic Summary by Winning Party") |> 
+  # Set explicit header labels for readability
+  set_header_labels(
+    winning_party = "Winning Party",
+    Counties_Won = "Counties Won",
+    Avg_Median_Income = "Avg Median Income",
+    Avg_Poverty_Rate = "Avg Poverty Rate",
+    Avg_Population = "Avg Population"
+  ) |> 
+  colformat_double(j = "Avg_Median_Income", prefix = "$", digits = 0) |> 
+  colformat_double(j = "Avg_Poverty_Rate", digits = 3) |> 
+  colformat_double(j = "Avg_Population", digits = 0) |> 
+  autofit()
+```
+
+### 3.2 Categorical Frequency Table (Cross-Section)
+This cross-tabulation investigates the relationship between county population size and political preference. We categorized counties into "Small" (<20k), "Medium" (20k-100k), and "Large" (>100k). The table shows a clear trend: Republicans dominated small counties (winning 96.9%), while Democrats were most competitive in large population centers, winning 44.4% of counties with over 100,000 residents.
+```{r}
+#| label: freq-table
+
+# --- Rubric Requirement: Frequency table of two categorical variables ---
+# Create Pop_Tier variable
+freq_data <- county_outcomes |> 
+  mutate(Pop_Tier = case_when(
+    population < 20000 ~ "Small (<20k)",
+    population < 100000 ~ "Medium (20k-100k)",
+    TRUE ~ "Large (>100k)"
+  )) |> 
+  mutate(Pop_Tier = factor(Pop_Tier, levels = c("Small (<20k)", "Medium (20k-100k)", "Large (>100k)")))
+
+# Create the cross-tabulation
+freq_table <- freq_data |> 
+  tabyl(Pop_Tier, winning_party) |> 
+  adorn_totals("row") |> 
+  adorn_percentages("row") |> 
+  adorn_pct_formatting(digits = 1) |> 
+  adorn_ns() 
+
+freq_table |> 
+  flextable() |> 
+  set_caption("Table 3.2: Cross-Section of Population Tier and Winning Party") |> 
+  autofit()
+```
+
+### 3.3 Voter Participation Summary
+This table provides a high-level view of voter engagement. It aggregates the total votes cast in counties won by each party and calculates the average per-capita voting rate. Although Democrats won far fewer counties, the total volume of votes coming from Democratic counties (approx. 2.7 million) exceeded that of Republican counties (approx. 2.6 million), highlighting the density of the Democratic base.
+
+```{r}
+#| label: summary-table-2
+
+# Additional Summary Table (Rubric: At least two tables)
+participation_stats <- county_outcomes |>
+  mutate(votes_per_capita = totalvotes / population) |> 
+  group_by(winning_party) |>
+  summarize(
+    Total_Votes_Cast = sum(totalvotes, na.rm = TRUE),
+    Avg_Votes_Per_Capita = mean(votes_per_capita, na.rm = TRUE)
+  )
+
+participation_stats |>
+  flextable() |> 
+  set_caption("Table 3.3: Voter Participation Summary") |> 
+  # Set explicit header labels for readability
+  set_header_labels(
+    winning_party = "Winning Party",
+    Total_Votes_Cast = "Total Votes Cast",
+    Avg_Votes_Per_Capita = "Avg Votes Per Capita"
+  ) |> 
+  colformat_double(j = "Total_Votes_Cast", digits = 0, big.mark = ",") |> 
+  colformat_double(j = "Avg_Votes_Per_Capita", digits = 3) |> 
+  autofit()
+```
+
+
+## 4. Data Visualization
+
+### 4.1 Votes Per Capita vs. Median Income (Scatter Plot)
+This plot examines the relationship between economic status (Median Income) and voter participation (Votes Per Capita). We calculate `votes_per_capita` as the total votes cast divided by the total population. A smoothing line is included to highlight the trend within each party's strongholds.
+```{r}
+#| label: viz-scatter
+#| fig-cap: "Relationship between income and voter turnout proxy."
+
+# --- Rubric: Quant vs Quant + Categorical ---
+scatter_data <- county_outcomes |> 
+  mutate(votes_per_capita = totalvotes / population) |> 
+  filter(winning_party %in% c("DEMOCRAT", "REPUBLICAN"))
+
+ggplot(scatter_data, aes(x = median_income, y = votes_per_capita, color = winning_party)) +
+  geom_point(alpha = 0.7, size = 3) +
+  geom_smooth(method = "lm", se = FALSE, size = 1.2) + 
+  scale_color_manual(values = party_colors) +
+  scale_x_continuous(labels = dollar_format()) +
+  labs(title = "Votes Per Capita vs. Income",
+       x = "Median Household Income", 
+       y = "Votes Per Capita",
+       color = NULL)
+```
+
+### 4.2 Poverty Rates by Winner (Boxplot)
+This boxplot compares the distribution of poverty rates between counties won by Democrats versus Republicans. It highlights the central tendency (median) and spread (IQR) of poverty within these two groups.
+```{r}
+#| label: viz-boxplot
+#| fig-cap: "Distribution of poverty rates across winning parties."
+
+# --- Rubric: Quant vs Categorical (Distribution) ---
+ggplot(county_outcomes, aes(x = winning_party, y = prop_poverty, fill = winning_party)) +
+  geom_boxplot(alpha = 0.8) +
+  scale_fill_manual(values = party_colors) +
+  scale_y_continuous(labels = percent_format()) +
+  labs(title = "Poverty Rates by Winner",
+       x = "Winning Party", 
+       y = "Proportion in Poverty",
+       fill = NULL) +
+  theme(legend.position = "none")
+```
+### 4.3 Density Plot: Income Distribution
+This density plot visualizes the distribution of median household incomes for counties won by each party. It allows us to see overlap and shifts in income distribution.
+
+```{r}
+#| label: viz-density
+#| fig-cap: "Density estimation of county median incomes."
+
+ggplot(county_outcomes, aes(x = median_income, fill = winning_party)) +
+  geom_density(alpha = 0.6, color = "white") + 
+  scale_fill_manual(values = party_colors) +
+  scale_x_continuous(labels = dollar_format()) +
+  labs(title = "Income Distribution",
+       x = "Median Household Income",
+       y = "Density",
+       fill = NULL)
+```
+### 4.4 Interactive Map of Election Winners
+This interactive map allows users to explore election results geographically by utilizing `leaflet()`. By hovering over a county, the user can see the `county_name`, the `winning_party`, and the specific `median_income`, providing a spatial context to the economic data.
+```{r}
+#| label: viz-map
+#| fig-cap: "Interactive map showing 2020 Michigan election results."
+
+# --- Rubric: Interactive Visualization ---
+options(tigris_use_cache = TRUE)
+mi_counties <- counties(state = "MI", cb = TRUE, year = 2020, progress_bar = FALSE)
+
+map_data <- mi_counties |> 
+  mutate(GEOID = as.numeric(GEOID)) |> 
+  left_join(county_outcomes, by = c("GEOID" = "county_fips"))
+
+pal <- colorFactor(palette = c("#0072B2", "#D55E00"), domain = map_data$winning_party)
+
+leaflet(map_data) |> 
+  addTiles() |> 
+  addPolygons(
+    fillColor = ~pal(winning_party),
+    weight = 1,
+    opacity = 1,
+    color = "white",
+    fillOpacity = 0.7,
+    label = ~paste0(county_name, ": ", winning_party, 
+                    " (Pop: ", comma(population), 
+                    ", Income: $", comma(median_income), ")")
+  ) |> 
+  addLegend(pal = pal, values = ~winning_party, title = "Winner", position = "bottomright")
+```
+
+### 4.5 Faceted Bar Chart: Top 5 Counties by Votes
+This faceted bar chart displays the counties that contributed the most votes to each party. It highlights the urban concentration of Democratic votes compared to the specific strongholds for Republicans.
+
+```{r}
+#| label: viz-bar-faceted
+#| fig-cap: "Top contributing counties for each major party."
+
+# --- Rubric: Categorical vs Categorical (Faceted) ---
+merged_df |> 
+  distinct(county_fips, party, .keep_all = TRUE) |> 
+  filter(party %in% c("DEMOCRAT", "REPUBLICAN")) |> 
+  group_by(party) |> 
+  slice_max(candidatevotes, n = 5) |> 
+  ggplot(aes(x = reorder(county_name, candidatevotes), y = candidatevotes, fill = party)) +
+  geom_col() +
+  coord_flip() + 
+  facet_wrap(~party, scales = "free_y") +
+  scale_fill_manual(values = party_colors) +
+  scale_y_continuous(labels = comma_format()) + 
+  labs(title = "Top 5 Counties by Votes",
+       x = NULL, 
+       y = "Total Votes Received",
+       fill = NULL) +
+  theme(legend.position = "none")
+```
+### 4.6 Wealthiest Counties Analysis (Lollipop Chart)
+As an advanced visualization, this "Lollipop Chart" ranks the top 15 wealthiest counties in Michigan and indicates their 2020 voting preference. This visualization specifically addresses whether the absolute highest income areas lean towards one party, providing a granular look at the upper tail of the economic distribution.
+```{r}
+#| label: viz-lollipop
+#| fig-cap: "Voting preference of the top 15 wealthiest counties."
+
+# Filtering for the top 15 counties by income
+top_wealth_counties <- county_outcomes |> 
+  slice_max(median_income, n = 15)
+
+# Creating the lollipop chart
+ggplot(top_wealth_counties, aes(x = reorder(county_name, median_income), y = median_income, color = winning_party)) +
+  geom_segment(aes(x = reorder(county_name, median_income), 
+                   xend = reorder(county_name, median_income), 
+                   y = 0, yend = median_income), 
+               color = "grey70", size = 0.8) +
+  geom_point(size = 5) +
+  scale_color_manual(values = party_colors) +
+  scale_y_continuous(labels = dollar_format()) +
+  coord_flip() +
+  labs(title = "Top 15 Wealthiest Counties: How Did They Vote?",
+       subtitle = "Ranking by Median Household Income",
+       x = NULL,
+       y = "Median Household Income",
+       color = "Winning Party")
+```
+
+## 5. Statistical Inference: Permutation Test
+**Hypothesis:** Is there a significant difference in the mean median household income between counties won by Democrats vs. Republicans?
+$H_0$: $\mu_{dem} - \mu_{rep} = 0$
+$H_A$: $\mu_{dem} - \mu_{rep} \neq 0$
+
+
+### 5.1 The Permutation Test (Manual Loop)
+```{r}
+#| label: permutation-test-final
+
+# 1. Filter data to only 2 parties for the test and remove NAs
+test_data <- county_outcomes |>
+  filter(winning_party %in% c("DEMOCRAT", "REPUBLICAN")) |>
+  filter(!is.na(median_income))
+
+# 2. Calculate the Observed Statistic (Difference in Means: DEMOCRAT - REPUBLICAN)
+obs_diff_data <- test_data |>
+  group_by(winning_party) |>
+  summarise(mean_income = mean(median_income))
+
+# Extract means using filter() and pull()
+mean_dem_obs <- obs_diff_data |> filter(winning_party == "DEMOCRAT") |> pull(mean_income)
+mean_rep_obs <- obs_diff_data |> filter(winning_party == "REPUBLICAN") |> pull(mean_income)
+
+# Calculate the observed difference
+obs_diff <- mean_dem_obs - mean_rep_obs
+
+# 3. Generate Null Distribution (Permutation)
+N_PERMS <- 1000 # Number of permutations
+set.seed(1994) # For reproducibility
+
+null_dist <- replicate(N_PERMS, {
+  # Permute the winning_party labels
+  permuted_labels <- sample(test_data$winning_party)
+
+  # Calculate the mean difference under the null hypothesis
+  perm_means <- test_data |>
+    mutate(perm_group = permuted_labels) |>
+    group_by(perm_group) |>
+    summarise(mean_income = mean(median_income))
+
+  # Extract means using filter() and pull()
+  mean_dem_perm <- perm_means |> filter(perm_group == "DEMOCRAT") |> pull(mean_income)
+  mean_rep_perm <- perm_means |> filter(perm_group == "REPUBLICAN") |> pull(mean_income)
+
+  # Calculate difference (DEMOCRAT - REPUBLICAN order)
+  return(mean_dem_perm - mean_rep_perm)
+})
+
+# 4. Calculate P-value (Two-sided test)
+# The p-value is the proportion of simulated differences that are as extreme or more extreme 
+# than the observed difference (in either positive or negative direction).
+p_value <- mean(abs(null_dist) >= abs(obs_diff))
+
+# --- Output Results ---
+cat(paste("Observed Difference (Democrat Avg - Republican Avg):", scales::dollar(obs_diff, accuracy = 1)))
+cat(paste("\nPermutation p-value:", p_value))
+```
+
+### 5.2 Visualization of Null Distribution
+```{r}
+#| label: permutation-plot-final-manual
+# Convert null distribution (vector) to a data frame for plotting
+null_dist_df <- data.frame(perm_diff = null_dist)
+
+# Calculate 95% critical values from the null distribution
+critical_values <- quantile(null_dist, c(0.025, 0.975))
+
+ggplot(null_dist_df, aes(x = perm_diff)) +
+  # Draw the null distribution histogram
+  geom_histogram(bins = 50, color = "black") +
+  
+  # 1. Add vertical lines for the 95% Critical Values (Blue Dotted)
+  geom_vline(xintercept = critical_values, 
+             color = "blue", 
+             linetype = "dotted", 
+             linewidth = 1) +
+  
+  # 2. Add vertical line for the Observed Difference (Red Solid/Dashed)
+  geom_vline(xintercept = obs_diff, color = "red", linewidth = 1.5) +
+  geom_vline(xintercept = -obs_diff, color = "red", linewidth = 1.5, linetype = "dashed") +
+  
+  # --- ADDING HORIZONTAL TEXT LABELS (NO ANGLE=90) ---
+  
+  # Label 1: Observed Difference Value and Meaning (Red)
+  # Positioned at the top left (x=0) and adjusted vertically (vjust)
+  annotate("label", x = 0, y = Inf, 
+           label = paste0("Observed Diff: ", scales::dollar(obs_diff, accuracy = 1), 
+                          " (Test Statistic)"), 
+           vjust = 2.0, hjust = 0, color = "red", fontface = "bold", size = 4, fill = "#F2DEDE") +
+  
+  # Label 2: Upper Critical Value and Meaning (Blue)
+  # Positioned slightly lower
+  annotate("label", x = 0, y = Inf, 
+           label = paste0("95% Cutoff : ", scales::dollar(critical_values[2], accuracy = 1), 
+                          " (Significance Threshold)"), 
+           vjust = 3.5, hjust = 0, color = "blue", fontface = "bold", size = 4, fill = "#DEEBF7") +
+  
+  theme_minimal() +
+  labs(
+    title = "Permutation Test Null Distribution (1,000 Permutations)",
+    subtitle = "Difference in Mean Median Income (Democrat - Republican) under H₀",
+    x = "Permuted Difference in Mean Income (USD)",
+    y = "Count",
+    caption = "Red lines show the observed difference. Blue dotted lines show the 95% significance critical values."
+  ) +
+  # Format x-axis as currency
+  scale_x_continuous(labels = scales::dollar)
+```
+
+**Conclusion:** The p-value is `r p_value`. Since this is less than 0.05, we reject the null hypothesis. There is statistically significant evidence to suggest a difference in the economic status (median income) of counties won by Democrats versus Republicans in Michigan in 2020.
+
+### 5.3 Key Findings
+Based on our analysis of the 2020 Michigan Presidential Election and 2019 Census data, we have identified several key patterns regarding economic status and political alignment:
+
+**Economic Disparity:** There is a statistically significant difference in median household income between counties won by Democrats and those won by Republicans. As shown in **Table 3.1** and the **Permutation Test** above, counties won by Democrats had a significantly higher average median income (~$58,000) compared to those won by Republicans **(~$51,000)**. The observed difference **(approx. $7,000)** lies far outside the null distribution, resulting in a **p-value** of `r p_value`, leading us to reject the null hypothesis.
+
+**Geographic & Population Divide:** While Republicans won the vast majority of counties (72 out of 83), Democrats won the most populous counties (e.g., Wayne, Oakland). The **Interactive Map (Section 4.4)** visually confirms that Democratic strength is concentrated in urban centers, while Republican strength is distributed across rural areas.
+
+**Voter Participation Trends:** The **Scatter Plot (Section 4.1)** suggests a positive relationship between median income and voter participation (votes per capita). Wealthier counties tended to have higher per-capita voting rates, and these counties were more likely to lean Democratic.
+
+**Wealthiest Counties:** The **Lollipop Chart (Section 4.6)** reveals that among the top 15 wealthiest counties in Michigan, the results were mixed, but major suburban wealth centers (like Oakland and Washtenaw) voted Democratic, highlighting a shift in suburban voting patterns.
+
+**Conclusion:** We reject the null hypothesis that there is no difference in economic status between Democratic and Republican counties. The data supports the conclusion that in the 2020 Michigan election, higher county-level income and population density were strong predictors of Democratic success.
+
+
+## 6. Contributions
+```{r}
+#| label: contributions
+#| echo: false
+
+# Create the contributions data frame
+contributions_df <- tibble::tribble(
+  ~"Team Member", ~"Key Contributions",
+  "Zhiyan Chen",  "Responsible for Data Preparation (Section 2), including loading, cleaning with `janitor`, and performing the joins. Developed the Interactive Leaflet Map (Section 4.4) using `tigris` and `leaflet`. Drafted the Introduction and Missingness analysis.",
+  
+  "Cliff Mutegi", "Created the Group-Level Summary Statistics (Tables 3.1 & 3.2). Developed all static `ggplot2` visualizations (Sections 4.1, 4.2, 4.3, 4.5, 4.6) ensuring colorblind accessibility. Performed and interpreted the Permutation Test (Section 5).",
+  
+  "Joint Effort", "Collaborated on initial project ideation, defining research questions, debugging code errors, drafting the Key Findings (Section 6), refining the final narrative, and developing the project dashboard."
+)
+
+# Render as a formatted table
+contributions_df |> 
+  flextable() |> 
+  set_caption("Table 7.1: Project Contributions") |> 
+  width(j = "Key Contributions", width = 4.5) |> # Widen the text column for readability
+  theme_vanilla() |> 
+  autofit()
+```
+
+
+
+
+
+
